@@ -1,10 +1,20 @@
 # ask_api.py
 # -*- coding: utf-8 -*-
+"""
+TCB AI Customer Assistant API
+
+用途：
+- 讀取 tcb_ai_knowledge_v5.json
+- 提供 /ask 給 Copilot Studio / Power Automate / Custom Connector 呼叫
+- FAQ 精準優先
+- 避免 sources 混入太多不相關資料
+- 回傳 answer / confidence / sources
+"""
 
 import json
 import re
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +26,7 @@ KNOWLEDGE_FILE = BASE_DIR / "tcb_ai_knowledge_v5.json"
 
 app = FastAPI(
     title="TCB AI Customer Assistant API",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -37,7 +47,26 @@ class AskRequest(BaseModel):
 knowledge: List[Dict[str, Any]] = []
 
 
-def clean_text(text):
+STOPWORDS = {
+    "請問", "怎麼", "如何", "可以", "是否", "我要", "想問",
+    "合庫", "合作金庫", "銀行", "本行", "的", "是", "嗎", "呢",
+    "一下", "辦理", "申請", "相關", "服務"
+}
+
+SYNONYMS = {
+    "掛失": ["遺失", "不見", "被竊", "被偷", "掉了", "補發"],
+    "信用卡": ["卡片", "國際信用卡", "持卡", "刷卡"],
+    "金融卡": ["visa金融卡", "combo卡", "提款卡"],
+    "繳稅": ["牌照稅", "地價稅", "房屋稅", "所得稅", "網路繳稅"],
+    "預借現金": ["借現金", "現金", "預借"],
+    "額度": ["信用額度", "臨時提高", "調高額度"],
+    "帳單": ["帳款", "消費明細", "繳款"],
+    "客服": ["電話", "專線", "客服中心"],
+    "機場接送": ["接機", "送機", "機場", "肯驛"],
+}
+
+
+def clean_text(text: Any) -> str:
     if text is None:
         return ""
     text = str(text)
@@ -58,7 +87,23 @@ def load_knowledge():
     if not isinstance(data, list):
         raise ValueError("知識庫格式錯誤，最外層必須是 list")
 
-    knowledge = data
+    cleaned = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        item = dict(item)
+        item["title"] = clean_text(item.get("title"))
+        item["intent"] = clean_text(item.get("intent"))
+        item["page_type"] = clean_text(item.get("page_type"))
+        item["source_url"] = clean_text(item.get("source_url"))
+        item["content"] = clean_text(item.get("content"))
+        item["faq_question"] = clean_text(item.get("faq_question"))
+        item["faq_answer"] = clean_text(item.get("faq_answer"))
+
+        cleaned.append(item)
+
+    knowledge = cleaned
 
 
 @app.on_event("startup")
@@ -66,31 +111,32 @@ def startup():
     load_knowledge()
 
 
-def tokenize(question: str):
-    question = clean_text(question)
+def tokenize(question: str) -> List[str]:
+    question = clean_text(question).lower()
+    words: List[str] = []
 
-    words = []
+    words.extend(re.findall(r"[a-zA-Z0-9]+", question))
 
-    # 中文 2~4 字關鍵字
     zh_parts = re.findall(r"[\u4e00-\u9fff]+", question)
     for part in zh_parts:
         if len(part) >= 2:
             words.append(part)
+
         for n in [2, 3, 4]:
-            for i in range(len(part) - n + 1):
-                words.append(part[i:i+n])
+            if len(part) >= n:
+                for i in range(len(part) - n + 1):
+                    words.append(part[i:i+n])
 
-    # 英文數字
-    words.extend(re.findall(r"[a-zA-Z0-9]+", question.lower()))
-
-    stopwords = {
-        "請問", "怎麼", "如何", "可以", "是否", "我要",
-        "合庫", "合作金庫", "銀行", "的", "是", "嗎"
-    }
+    expanded = list(words)
+    for key, values in SYNONYMS.items():
+        if key in question or any(v in question for v in values):
+            expanded.append(key)
+            expanded.extend(values)
 
     result = []
-    for w in words:
-        if w and w not in stopwords and w not in result:
+    for w in expanded:
+        w = clean_text(w).lower()
+        if w and w not in STOPWORDS and w not in result:
             result.append(w)
 
     return result
@@ -110,36 +156,44 @@ def build_search_text(item: Dict[str, Any]) -> str:
 
 def score_item(item: Dict[str, Any], question: str, terms: List[str]) -> float:
     search_text = build_search_text(item)
-
     title = clean_text(item.get("title")).lower()
     faq_question = clean_text(item.get("faq_question")).lower()
     faq_answer = clean_text(item.get("faq_answer")).lower()
     page_type = clean_text(item.get("page_type")).lower()
 
+    q = clean_text(question).lower()
     score = 0.0
 
-    q = clean_text(question).lower()
-
     if faq_question:
-        if q in faq_question:
-            score += 20
-        if faq_question in q:
-            score += 15
+        if q == faq_question:
+            score += 100
+        elif q in faq_question or faq_question in q:
+            score += 60
+
+    important_terms = [
+        "掛失", "遺失", "不見", "被竊",
+        "預借現金", "繳稅", "機場接送",
+        "帳單", "額度", "客服", "電話"
+    ]
 
     for term in terms:
         term = term.lower()
 
+        weight = 1.0
+        if term in important_terms:
+            weight = 2.0
+
         if term in faq_question:
-            score += 8
+            score += 12 * weight
         if term in title:
-            score += 5
+            score += 5 * weight
         if term in faq_answer:
-            score += 4
+            score += 4 * weight
         if term in search_text:
-            score += 2
+            score += 1.5 * weight
 
     if page_type == "faq":
-        score *= 1.3
+        score *= 1.35
 
     if not item.get("source_url"):
         score *= 0.5
@@ -147,10 +201,9 @@ def score_item(item: Dict[str, Any], question: str, terms: List[str]) -> float:
     return score
 
 
-def search_knowledge(question: str, top_k: int = 5):
+def search_knowledge(question: str, top_k: int = 5) -> List[Tuple[Dict[str, Any], float]]:
     terms = tokenize(question)
-
-    results = []
+    results: List[Tuple[Dict[str, Any], float]] = []
 
     for item in knowledge:
         score = score_item(item, question, terms)
@@ -158,11 +211,40 @@ def search_knowledge(question: str, top_k: int = 5):
             results.append((item, score))
 
     results.sort(key=lambda x: x[1], reverse=True)
-
     return results[:top_k]
 
 
-def make_answer(item: Dict[str, Any]) -> str:
+def build_sources(results: List[Tuple[Dict[str, Any], float]]) -> List[Dict[str, Any]]:
+    if not results:
+        return []
+
+    top_score = results[0][1]
+    filtered = []
+
+    for item, score in results:
+        if score >= top_score * 0.55:
+            filtered.append((item, score))
+
+    if not filtered:
+        filtered = [results[0]]
+
+    sources = []
+    for item, score in filtered[:3]:
+        sources.append({
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "page_type": item.get("page_type"),
+            "intent": item.get("intent"),
+            "source_url": item.get("source_url"),
+            "score": round(score, 2),
+            "faq_question": item.get("faq_question"),
+            "preview": clean_text(item.get("faq_answer") or item.get("content"))[:200]
+        })
+
+    return sources
+
+
+def make_customer_answer(item: Dict[str, Any]) -> str:
     title = clean_text(item.get("title"))
     source_url = clean_text(item.get("source_url"))
     page_type = clean_text(item.get("page_type"))
@@ -171,20 +253,32 @@ def make_answer(item: Dict[str, Any]) -> str:
     faq_answer = clean_text(item.get("faq_answer"))
     content = clean_text(item.get("content"))
 
-    if page_type == "faq" and faq_answer:
-        answer = faq_answer
-        if faq_question:
-            final = f"根據合庫官網資料，關於「{faq_question}」：\n\n{answer}"
-        else:
-            final = f"根據合庫官網 FAQ 資料：\n\n{answer}"
+    raw_answer = faq_answer if (page_type == "faq" and faq_answer) else content
+    raw_answer = raw_answer[:1500]
+
+    if any(k in (faq_question + raw_answer) for k in ["掛失", "遺失", "被竊"]):
+        final = "可以，信用卡或金融卡遺失時，建議您立即辦理掛失，避免被冒用。\n\n"
+        final += "重點如下：\n"
+        final += raw_answer
     else:
-        answer = content[:1200]
-        final = f"根據合庫官網「{title}」頁面資料：\n\n{answer}"
+        if faq_question:
+            final = f"根據合庫官網 FAQ「{faq_question}」，說明如下：\n\n{raw_answer}"
+        elif title:
+            final = f"根據合庫官網「{title}」頁面資料，說明如下：\n\n{raw_answer}"
+        else:
+            final = f"根據合庫官網資料，說明如下：\n\n{raw_answer}"
 
     if source_url:
         final += f"\n\n資料來源：{source_url}"
 
     return final
+
+
+def no_answer(question: str) -> str:
+    return (
+        "目前知識庫沒有找到足夠明確的答案，為避免提供錯誤資訊，"
+        "建議請客戶補充業務類型、卡別或申辦項目，或轉由人工客服確認。"
+    )
 
 
 @app.get("/")
@@ -209,39 +303,38 @@ def health():
 
 @app.post("/ask")
 def ask_post(req: AskRequest):
-    results = search_knowledge(req.question, req.top_k)
+    question = clean_text(req.question)
+    results = search_knowledge(question, req.top_k)
 
     if not results:
         return {
-            "question": req.question,
-            "answer": "目前知識庫沒有找到足夠明確的答案，建議請客戶補充問題或轉人工確認。",
+            "question": question,
+            "answer": no_answer(question),
             "confidence": 0,
             "sources": []
         }
 
     top_item, top_score = results[0]
+    confidence = round(min(top_score / 80, 1), 2)
 
-    answer = make_answer(top_item)
+    if confidence < 0.25:
+        return {
+            "question": question,
+            "answer": no_answer(question),
+            "confidence": confidence,
+            "sources": build_sources(results)
+        }
 
-    sources = []
-    for item, score in results:
-        sources.append({
-            "id": item.get("id"),
-            "title": item.get("title"),
-            "page_type": item.get("page_type"),
-            "intent": item.get("intent"),
-            "source_url": item.get("source_url"),
-            "score": round(score, 2),
-            "preview": clean_text(item.get("faq_answer") or item.get("content"))[:150]
-        })
+    answer = make_customer_answer(top_item)
+    sources = build_sources(results)
 
     return {
-        "question": req.question,
+        "question": question,
         "answer": answer,
-        "confidence": round(min(top_score / 50, 1), 2),
+        "confidence": confidence,
         "sources": sources,
         "debug": {
-            "terms": tokenize(req.question),
+            "terms": tokenize(question),
             "top_score": top_score
         } if req.debug else None
     }
@@ -257,6 +350,16 @@ def ask_get(
     return ask_post(req)
 
 
+@app.get("/ask_text")
+def ask_text(
+    q: str = Query(..., description="問題，例如：信用卡掛失怎麼辦"),
+    top_k: int = Query(5, ge=1, le=10)
+):
+    req = AskRequest(question=q, top_k=top_k, debug=False)
+    result = ask_post(req)
+    return result["answer"]
+
+
 @app.get("/search")
 def search_get(
     q: str = Query(...),
@@ -267,17 +370,5 @@ def search_get(
     return {
         "query": q,
         "count": len(results),
-        "results": [
-            {
-                "id": item.get("id"),
-                "title": item.get("title"),
-                "page_type": item.get("page_type"),
-                "intent": item.get("intent"),
-                "source_url": item.get("source_url"),
-                "score": round(score, 2),
-                "faq_question": item.get("faq_question"),
-                "preview": clean_text(item.get("faq_answer") or item.get("content"))[:200]
-            }
-            for item, score in results
-        ]
+        "results": build_sources(results)
     }
