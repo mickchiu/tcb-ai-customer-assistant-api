@@ -382,7 +382,7 @@ def ask_get(
     return ask_post(req)
 
 
-@app.get("/ask_text")
+@app.get("/ask_text", response_class=PlainTextResponse)
 def ask_text(
     q: str = Query(..., description="問題，例如：信用卡掛失怎麼辦"),
     top_k: int = Query(5, ge=1, le=10)
