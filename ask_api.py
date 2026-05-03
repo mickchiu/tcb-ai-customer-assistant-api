@@ -253,7 +253,7 @@ def build_sources(results: List[Tuple[Dict[str, Any], float]]) -> List[Dict[str,
     return sources
 
 
-def shorten_answer(text: str, max_len: int = 650) -> str:
+def shorten_answer(text: str, max_len: int = 400) -> str:
     text = clean_text(text)
     if len(text) <= max_len:
         return text
