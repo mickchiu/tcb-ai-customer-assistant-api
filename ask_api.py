@@ -256,22 +256,53 @@ def make_customer_answer(item: Dict[str, Any]) -> str:
     raw_answer = faq_answer if (page_type == "faq" and faq_answer) else content
     raw_answer = raw_answer[:1500]
 
-    if any(k in (faq_question + raw_answer) for k in ["掛失", "遺失", "被竊"]):
-        final = "可以，信用卡或金融卡遺失時，建議您立即辦理掛失，避免被冒用。\n\n"
-        final += "重點如下：\n"
-        final += raw_answer
+    # ===== 分析內容 =====
+    is_lost = any(k in (faq_question + raw_answer) for k in ["掛失", "遺失", "被竊"])
+    
+    # 抓電話
+    phones = re.findall(r"(0\d{1,3}-?\d{6,8}|0800-?\d{3}-?\d{3})", raw_answer)
+    phone_text = " / ".join(set(phones)) if phones else "請洽官方客服"
+
+    # ===== 組客服格式 =====
+    if is_lost:
+        answer = f"""【處理方式】
+信用卡或金融卡遺失時，請立即辦理掛失，以避免被冒用。
+
+【步驟】
+1. 立即撥打客服專線辦理掛失
+2. 後續至原發卡分行補辦書面手續
+3. 申請補發新卡
+
+【注意事項】
+- 掛失後即可停止卡片使用，降低風險
+- 掛失前可能有自負額（依銀行規定）
+- 掛失後通常會收取手續費
+
+【客服電話】
+{phone_text}
+
+【詳細說明】
+{raw_answer}
+
+資料來源：{source_url}
+"""
     else:
-        if faq_question:
-            final = f"根據合庫官網 FAQ「{faq_question}」，說明如下：\n\n{raw_answer}"
-        elif title:
-            final = f"根據合庫官網「{title}」頁面資料，說明如下：\n\n{raw_answer}"
-        else:
-            final = f"根據合庫官網資料，說明如下：\n\n{raw_answer}"
+        answer = f"""【處理方式】
+{title or "請參考以下說明"}
 
-    if source_url:
-        final += f"\n\n資料來源：{source_url}"
+【步驟】
+請依下列方式辦理：
 
-    return final
+【詳細說明】
+{raw_answer}
+
+【客服電話】
+{phone_text}
+
+資料來源：{source_url}
+"""
+
+    return answer.strip()
 
 
 def no_answer(question: str) -> str:
