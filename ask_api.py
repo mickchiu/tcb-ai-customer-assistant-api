@@ -17,7 +17,7 @@ KNOWLEDGE_FILE = BASE_DIR / "tcb_ai_knowledge_v5.json"
 
 app = FastAPI(
     title="TCB AI Customer Assistant API",
-    version="3.1.0"
+    version="3.2.0"
 )
 
 app.add_middleware(
@@ -50,7 +50,7 @@ SYNONYMS = {
     "掛失": ["遺失", "不見", "被竊", "被偷", "掉了", "補發"],
     "信用卡": ["卡片", "國際信用卡", "持卡", "刷卡"],
     "金融卡": ["visa金融卡", "combo卡", "提款卡"],
-    "開戶": ["帳戶", "存款", "數位帳戶", "預約開戶"],
+    "開戶": ["帳戶", "存款", "數位帳戶", "預約開戶", "未成年開戶", "未成年人開戶"],
     "貸款": ["房貸", "信貸", "信用貸款", "房屋貸款"],
     "繳稅": ["牌照稅", "地價稅", "房屋稅", "所得稅", "網路繳稅"],
     "預借現金": ["借現金", "現金", "預借"],
@@ -110,16 +110,23 @@ def startup():
 def detect_intent(question: str) -> str:
     q = clean_text(question).lower()
 
-    if any(k in q for k in ["信用卡", "卡片", "掛失", "刷卡", "預借現金", "額度", "帳單"]):
-        return "信用卡"
-    if any(k in q for k in ["開戶", "帳戶", "存款", "數位帳戶"]):
+    if any(k in q for k in ["金融卡", "visa金融卡", "combo卡", "提款卡"]):
+        return "金融卡"
+
+    if any(k in q for k in ["開戶", "帳戶", "存款", "數位帳戶", "未成年", "未成年人"]):
         return "開戶"
+
     if any(k in q for k in ["貸款", "房貸", "信貸", "信用貸款"]):
         return "貸款"
+
     if any(k in q for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"]):
         return "繳稅"
+
     if any(k in q for k in ["機場接送", "接機", "送機"]):
         return "信用卡優惠服務"
+
+    if any(k in q for k in ["信用卡", "卡片", "掛失", "刷卡", "預借現金", "額度", "帳單"]):
+        return "信用卡"
 
     return "其他"
 
@@ -174,8 +181,25 @@ def score_item(item: Dict[str, Any], question: str, terms: List[str]) -> float:
     faq_question = clean_text(item.get("faq_question")).lower()
     faq_answer = clean_text(item.get("faq_answer")).lower()
     page_type = clean_text(item.get("page_type")).lower()
+    item_intent = clean_text(item.get("intent")).lower()
 
     q = clean_text(question).lower()
+    detected_intent = detect_intent(question)
+
+    # 重要防呆：開戶 / 貸款問題不要誤抓信用卡 FAQ
+    if detected_intent == "開戶" and item_intent == "credit_card":
+        return 0
+
+    if detected_intent == "貸款" and item_intent == "credit_card":
+        return 0
+
+    # 金融卡可以用信用卡 FAQ 中的 VISA金融卡 / Combo卡 掛失內容
+    if detected_intent == "金融卡":
+        has_debit_card_info = any(k in search_text for k in ["金融卡", "visa金融卡", "combo卡", "提款卡"])
+        has_lost_info = any(k in search_text for k in ["掛失", "遺失", "被竊"])
+        if not (has_debit_card_info or has_lost_info):
+            return 0
+
     score = 0.0
 
     if faq_question:
@@ -186,9 +210,10 @@ def score_item(item: Dict[str, Any], question: str, terms: List[str]) -> float:
 
     important_terms = {
         "掛失", "遺失", "不見", "被竊", "被偷",
-        "信用卡", "金融卡", "預借現金", "繳稅",
-        "機場接送", "帳單", "額度", "客服", "電話",
-        "開戶", "貸款", "房貸", "信貸"
+        "信用卡", "金融卡", "提款卡", "visa金融卡", "combo卡",
+        "預借現金", "繳稅", "機場接送", "帳單", "額度",
+        "客服", "電話", "開戶", "未成年", "未成年人",
+        "貸款", "房貸", "信貸"
     }
 
     for term in terms:
@@ -376,6 +401,7 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
     is_cash_advance = any(k in combined for k in ["預借現金", "借現金"])
     is_tax = any(k in combined for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"])
     is_airport = any(k in combined for k in ["機場接送", "接機", "送機"])
+    is_account_opening = detect_intent(question) == "開戶"
 
     if is_lost:
         process = "信用卡或金融卡遺失時，請立即辦理掛失，以避免卡片遭冒用。"
@@ -388,6 +414,19 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
             "- 掛失後可降低卡片遭冒用風險\n"
             "- 掛失前如已遭冒用，仍可能依規定負擔自付額\n"
             "- 掛失或補發可能產生手續費，實際費用請依官網或分行說明為準"
+        )
+
+    elif is_account_opening:
+        process = f"以下為合庫官網針對「{question_context}」提供的開戶相關說明。"
+        steps = (
+            "1. 請確認開戶人身分與年齡條件\n"
+            "2. 準備身分證明文件及銀行要求文件\n"
+            "3. 若為未成年人，建議先洽分行確認是否需法定代理人陪同或提供相關文件"
+        )
+        notes = (
+            "- 未成年人開戶通常涉及法定代理人或監護人文件要求\n"
+            "- 實際所需文件可能依帳戶類型、開戶方式與分行規定不同\n"
+            "- 請以合庫官網與分行最新說明為準"
         )
 
     elif is_cash_advance:
@@ -461,10 +500,6 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
 
 
 def compact_answer(answer: str, sources: List[Dict[str, Any]]) -> str:
-    """
-    給 Copilot Studio 顯示用：避免被截斷。
-    保留重點欄位，移除過長的【詳細說明】，並固定保留【資料來源】。
-    """
     source_url = ""
     if sources:
         source_url = sources[0].get("source_url") or ""
@@ -497,7 +532,7 @@ def root():
     return {
         "status": "ok",
         "service": "TCB AI Customer Assistant API",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "knowledge_file": str(KNOWLEDGE_FILE.name),
         "knowledge_count": len(knowledge),
         "docs": "/docs"
@@ -508,7 +543,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "knowledge_file_exists": KNOWLEDGE_FILE.exists(),
         "knowledge_count": len(knowledge)
     }
@@ -520,10 +555,11 @@ def ask_post(req: AskRequest):
     results = search_knowledge(question, req.top_k)
 
     if not results:
+        answer = no_answer(question)
         return {
             "question": question,
-            "answer": no_answer(question),
-            "full_answer": no_answer(question),
+            "answer": answer,
+            "full_answer": answer,
             "confidence": 0,
             "intent": detect_intent(question),
             "sources": []
