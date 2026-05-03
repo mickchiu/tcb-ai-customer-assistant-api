@@ -288,6 +288,9 @@ def extract_phones(text: str) -> str:
 
         if p == "0422273131":
             p = "04-2227-3131"
+            
+        if p == "042227-3131":
+            p = "04-2227-3131"
 
         if p not in normalized:
             normalized.append(p)
