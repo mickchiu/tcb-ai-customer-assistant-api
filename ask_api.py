@@ -15,9 +15,10 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_FILE = BASE_DIR / "tcb_ai_knowledge_v5.json"
 
+
 app = FastAPI(
     title="TCB AI Customer Assistant API",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -41,12 +42,12 @@ knowledge: List[Dict[str, Any]] = []
 STOPWORDS = {
     "請問", "怎麼", "如何", "可以", "是否", "我要", "想問",
     "合庫", "合作金庫", "銀行", "本行", "的", "是", "嗎", "呢",
-    "一下", "辦理", "申請", "相關", "服務", "問題"
+    "一下", "辦理", "申請", "相關", "服務", "問題", "資料"
 }
 
 
 SYNONYMS = {
-    "掛失": ["遺失", "不見", "被竊", "被偷", "掉了", "補發", "遺失怎麼辦"],
+    "掛失": ["遺失", "不見", "被竊", "被偷", "掉了", "補發"],
     "信用卡": ["卡片", "國際信用卡", "持卡", "刷卡"],
     "金融卡": ["visa金融卡", "combo卡", "提款卡"],
     "開戶": ["帳戶", "存款", "數位帳戶", "預約開戶"],
@@ -87,6 +88,7 @@ def load_knowledge():
             continue
 
         item = dict(item)
+        item["id"] = clean_text(item.get("id"))
         item["title"] = clean_text(item.get("title"))
         item["intent"] = clean_text(item.get("intent"))
         item["page_type"] = clean_text(item.get("page_type"))
@@ -120,6 +122,9 @@ def detect_intent(question: str) -> str:
     if any(k in q for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"]):
         return "繳稅"
 
+    if any(k in q for k in ["機場接送", "接機", "送機"]):
+        return "信用卡優惠服務"
+
     return "其他"
 
 
@@ -140,6 +145,7 @@ def tokenize(question: str) -> List[str]:
                     words.append(part[i:i+n])
 
     expanded = list(words)
+
     for key, values in SYNONYMS.items():
         if key in question or any(v in question for v in values):
             expanded.append(key)
@@ -178,22 +184,22 @@ def score_item(item: Dict[str, Any], question: str, terms: List[str]) -> float:
 
     if faq_question:
         if q == faq_question:
-            score += 100
+            score += 120
         elif q in faq_question or faq_question in q:
-            score += 60
+            score += 80
 
-    important_terms = [
+    important_terms = {
         "掛失", "遺失", "不見", "被竊", "被偷",
         "信用卡", "金融卡", "預借現金", "繳稅",
         "機場接送", "帳單", "額度", "客服", "電話",
-        "開戶", "貸款"
-    ]
+        "開戶", "貸款", "房貸", "信貸"
+    }
 
     for term in terms:
-        weight = 2.0 if term in important_terms else 1.0
+        weight = 2.2 if term in important_terms else 1.0
 
         if term in faq_question:
-            score += 12 * weight
+            score += 14 * weight
         if term in title:
             score += 5 * weight
         if term in faq_answer:
@@ -253,7 +259,7 @@ def build_sources(results: List[Tuple[Dict[str, Any], float]]) -> List[Dict[str,
     return sources
 
 
-def shorten_answer(text: str, max_len: int = 400) -> str:
+def shorten_answer(text: str, max_len: int = 450) -> str:
     text = clean_text(text)
     if len(text) <= max_len:
         return text
@@ -261,21 +267,99 @@ def shorten_answer(text: str, max_len: int = 400) -> str:
 
 
 def extract_phones(text: str) -> str:
-    phones = re.findall(r"(?:\(?0\d{1,3}\)?-?\d{3,4}-?\d{3,4}|0800-?\d{3}-?\d{3}|886-?\d-?\d{4}-?\d{4})", text)
+    raw = re.findall(
+        r"(?:\(?0\d{1,3}\)?-?\d{3,4}-?\d{3,4}|0800-?\d{3}-?\d{3}|886-?\d-?\d{4}-?\d{4})",
+        text
+    )
 
     normalized = []
-    for p in phones:
-        p = p.replace("(", "").replace(")", "")
 
-        # 修正 0800
-        if p.startswith("0800") and "-" not in p:
-            p = f"{p[:4]}-{p[4:7]}-{p[7:]}" if len(p) == 10 else p
+    for p in raw:
+        p = p.replace("(", "").replace(")", "").replace(" ", "")
+
+        if p == "0800033175":
+            p = "0800-033-175"
+
+        if p == "0800-033175":
+            p = "0800-033-175"
+
+        if p == "04-22273131":
+            p = "04-2227-3131"
+
+        if p == "0422273131":
+            p = "04-2227-3131"
 
         if p not in normalized:
             normalized.append(p)
 
-    # 限制最多 2 個（避免爆炸）
-    return " / ".join(normalized[:2]) if normalized else "請洽客服"
+    preferred = []
+
+    for p in ["0800-033-175", "04-2227-3131"]:
+        if p in normalized:
+            preferred.append(p)
+
+    for p in normalized:
+        if p not in preferred:
+            preferred.append(p)
+
+    if preferred:
+        return " / ".join(preferred[:2])
+
+    return "請洽合庫官方客服或鄰近分行確認。"
+
+
+def risk_guard(question: str, confidence: float) -> bool:
+    q = clean_text(question).lower()
+
+    risky_keywords = [
+        "核准", "一定過", "保證", "個人資料", "查帳", "餘額",
+        "我的帳戶", "我的信用卡", "我的貸款", "我的額度",
+        "利率多少", "可以借多少", "可貸多少", "審核結果",
+        "身分證", "密碼", "otp", "驗證碼"
+    ]
+
+    if confidence < 0.4:
+        return True
+
+    if any(k in q for k in risky_keywords):
+        return True
+
+    return False
+
+
+def make_risk_answer(question: str, confidence: float, sources: List[Dict[str, Any]]) -> str:
+    intent = detect_intent(question)
+
+    source_url = ""
+    if sources:
+        source_url = sources[0].get("source_url") or ""
+
+    answer = f"""【業務類型】
+{intent}
+
+【處理方式】
+這個問題可能涉及個人條件、帳務資料或即時審核結果。為避免提供錯誤資訊，建議由人工客服或分行協助確認。
+
+【步驟】
+1. 請準備欲詢問的業務類型與基本資料
+2. 聯繫合庫客服或洽鄰近分行
+3. 若涉及個人帳務、額度、核准或利率，請以銀行查詢結果為準
+
+【注意事項】
+- 請勿在聊天中提供密碼、OTP、驗證碼或完整身分證字號
+- 個人帳務、信用額度、貸款核准與利率條件需由銀行系統或人工確認
+- 本回覆僅作一般資訊引導，不代表最終審核或交易結果
+
+【客服電話】
+0800-033-175 / 04-2227-3131"""
+
+    if source_url:
+        answer += f"""
+
+【資料來源】
+{source_url}"""
+
+    return answer.strip()
 
 
 def make_customer_answer(item: Dict[str, Any], question: str) -> str:
@@ -296,6 +380,9 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
     question_context = faq_question or title or "相關問題"
 
     is_lost = any(k in (question + faq_question + raw_answer) for k in ["掛失", "遺失", "被竊", "不見", "掉了"])
+    is_cash_advance = any(k in (question + faq_question + raw_answer) for k in ["預借現金", "借現金"])
+    is_tax = any(k in (question + faq_question + raw_answer) for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"])
+    is_airport = any(k in (question + faq_question + raw_answer) for k in ["機場接送", "接機", "送機"])
 
     if is_lost:
         process = "信用卡或金融卡遺失時，請立即辦理掛失，以避免卡片遭冒用。"
@@ -309,10 +396,52 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
             "- 掛失前如已遭冒用，仍可能依規定負擔自付額\n"
             "- 掛失或補發可能產生手續費，實際費用請依官網或分行說明為準"
         )
+
+    elif is_cash_advance:
+        process = "若需要小額資金，可依合庫信用卡預借現金規定辦理。"
+        steps = (
+            "1. 確認信用卡是否已申請預借現金密碼\n"
+            "2. 於可支援的 ATM 或指定櫃台辦理\n"
+            "3. 留意每日限額、次數與手續費"
+        )
+        notes = (
+            "- 預借現金通常會收取手續費\n"
+            "- 是否可辦理與額度限制，仍依卡片種類與銀行規定為準\n"
+            "- 若涉及個人額度，建議洽客服確認"
+        )
+
+    elif is_tax:
+        process = "可依合庫官網提供的信用卡繳稅方式辦理。"
+        steps = (
+            "1. 確認欲繳納的稅目\n"
+            "2. 依官網提供的繳稅平台或連結操作\n"
+            "3. 留意每筆手續費與公告規定"
+        )
+        notes = (
+            "- 不同稅目可能有不同手續費或限制\n"
+            "- 實際可繳項目與費用請以官網公告為準"
+        )
+
+    elif is_airport:
+        process = "符合指定卡別與消費條件者，可依活動辦法預約機場接送服務。"
+        steps = (
+            "1. 確認持有卡別是否符合活動資格\n"
+            "2. 確認指定期間內是否完成符合條件的刷卡消費\n"
+            "3. 依官網公告的預約方式辦理"
+        )
+        notes = (
+            "- 機場接送通常有預約期限、年度次數與服務區域限制\n"
+            "- 連續假期或旅遊旺季建議提早預約\n"
+            "- 實際資格、趟次與費用請以官網公告為準"
+        )
+
     else:
         process = f"以下為合庫官網針對「{question_context}」提供的說明。"
-        steps = "請依合庫官網或業務單位公告方式辦理；如涉及個人資料或帳務狀態，建議洽客服或分行確認。"
-        notes = "- 各項業務可能依身分、產品別、申請方式或最新公告而不同\n- 若涉及費用、資格或時效，建議以官網與分行說明為準"
+        steps = "請依合庫官網或業務單位公告方式辦理；如涉及個人資料、帳務狀態或資格條件，建議洽客服或分行確認。"
+        notes = (
+            "- 各項業務可能依身分、產品別、申請方式或最新公告而不同\n"
+            "- 若涉及費用、資格或時效，建議以官網與分行說明為準"
+        )
 
     answer = f"""【業務類型】
 {intent}
@@ -333,8 +462,7 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
 {short_answer}
 
 【資料來源】
-{source_url}
-"""
+{source_url}"""
 
     return answer.strip()
 
@@ -343,11 +471,11 @@ def no_answer(question: str) -> str:
     return (
         "【處理方式】\n"
         "目前知識庫沒有找到足夠明確的答案，為避免提供錯誤資訊，建議轉由人工客服確認。\n\n"
-        "【注意事項】\n"
-        "- 請補充業務類型，例如信用卡、開戶、貸款或繳稅\n"
-        "- 如涉及個人帳務、身分資料或即時狀態，請以客服或分行查詢結果為準\n\n"
+        "【步驟】\n"
+        "1. 請補充業務類型，例如信用卡、開戶、貸款或繳稅\n"
+        "2. 若涉及個人帳務、身分資料或即時狀態，請以客服或分行查詢結果為準\n\n"
         "【客服電話】\n"
-        "請洽合庫官方客服或鄰近分行確認。"
+        "0800-033-175 / 04-2227-3131"
     )
 
 
@@ -356,7 +484,7 @@ def root():
     return {
         "status": "ok",
         "service": "TCB AI Customer Assistant API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "knowledge_file": str(KNOWLEDGE_FILE.name),
         "knowledge_count": len(knowledge),
         "docs": "/docs"
@@ -367,7 +495,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "knowledge_file_exists": KNOWLEDGE_FILE.exists(),
         "knowledge_count": len(knowledge)
     }
@@ -389,18 +517,18 @@ def ask_post(req: AskRequest):
 
     top_item, top_score = results[0]
     confidence = round(min(top_score / 80, 1), 2)
+    sources = build_sources(results)
 
-    if confidence < 0.4:
+    if risk_guard(question, confidence):
         return {
             "question": question,
-            "answer": no_answer(question),
+            "answer": make_risk_answer(question, confidence, sources),
             "confidence": confidence,
             "intent": detect_intent(question),
-            "sources": build_sources(results)
+            "sources": sources
         }
 
     answer = make_customer_answer(top_item, question)
-    sources = build_sources(results)
 
     return {
         "question": question,
