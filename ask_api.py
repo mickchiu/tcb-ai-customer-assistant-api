@@ -262,16 +262,20 @@ def shorten_answer(text: str, max_len: int = 650) -> str:
 
 def extract_phones(text: str) -> str:
     phones = re.findall(r"(?:\(?0\d{1,3}\)?-?\d{3,4}-?\d{3,4}|0800-?\d{3}-?\d{3}|886-?\d-?\d{4}-?\d{4})", text)
-    clean_phones = []
+
+    normalized = []
     for p in phones:
         p = p.replace("(", "").replace(")", "")
-        if p not in clean_phones:
-            clean_phones.append(p)
 
-    if clean_phones:
-        return " / ".join(clean_phones[:4])
+        # 修正 0800
+        if p.startswith("0800") and "-" not in p:
+            p = f"{p[:4]}-{p[4:7]}-{p[7:]}" if len(p) == 10 else p
 
-    return "請洽合庫官方客服或鄰近分行確認。"
+        if p not in normalized:
+            normalized.append(p)
+
+    # 限制最多 2 個（避免爆炸）
+    return " / ".join(normalized[:2]) if normalized else "請洽客服"
 
 
 def make_customer_answer(item: Dict[str, Any], question: str) -> str:
