@@ -15,10 +15,9 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_FILE = BASE_DIR / "tcb_ai_knowledge_v5.json"
 
-
 app = FastAPI(
     title="TCB AI Customer Assistant API",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -34,6 +33,7 @@ class AskRequest(BaseModel):
     question: str
     top_k: int = 5
     debug: bool = False
+    compact: bool = True
 
 
 knowledge: List[Dict[str, Any]] = []
@@ -112,16 +112,12 @@ def detect_intent(question: str) -> str:
 
     if any(k in q for k in ["信用卡", "卡片", "掛失", "刷卡", "預借現金", "額度", "帳單"]):
         return "信用卡"
-
     if any(k in q for k in ["開戶", "帳戶", "存款", "數位帳戶"]):
         return "開戶"
-
     if any(k in q for k in ["貸款", "房貸", "信貸", "信用貸款"]):
         return "貸款"
-
     if any(k in q for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"]):
         return "繳稅"
-
     if any(k in q for k in ["機場接送", "接機", "送機"]):
         return "信用卡優惠服務"
 
@@ -259,7 +255,7 @@ def build_sources(results: List[Tuple[Dict[str, Any], float]]) -> List[Dict[str,
     return sources
 
 
-def shorten_answer(text: str, max_len: int = 450) -> str:
+def shorten_answer(text: str, max_len: int = 380) -> str:
     text = clean_text(text)
     if len(text) <= max_len:
         return text
@@ -275,29 +271,22 @@ def extract_phones(text: str) -> str:
     normalized = []
 
     for p in raw:
+        digits = re.sub(r"\D", "", p)
         p = p.replace("(", "").replace(")", "").replace(" ", "")
 
-        if p == "0800033175":
+        if digits == "0800033175":
             p = "0800-033-175"
-
-        if p == "0800-033175":
-            p = "0800-033-175"
-
-        if p == "04-22273131":
+        elif digits == "0422273131":
             p = "04-2227-3131"
-
-        if p == "0422273131":
-            p = "04-2227-3131"
-            
-        if p == "042227-3131":
-            p = "04-2227-3131"
+        elif digits == "886422273131":
+            p = "886-4-2227-3131"
 
         if p not in normalized:
             normalized.append(p)
 
     preferred = []
 
-    for p in ["0800-033-175", "04-2227-3131"]:
+    for p in ["0800-033-175", "04-2227-3131", "886-4-2227-3131"]:
         if p in normalized:
             preferred.append(p)
 
@@ -330,7 +319,7 @@ def risk_guard(question: str, confidence: float) -> bool:
     return False
 
 
-def make_risk_answer(question: str, confidence: float, sources: List[Dict[str, Any]]) -> str:
+def make_risk_answer(question: str, sources: List[Dict[str, Any]]) -> str:
     intent = detect_intent(question)
 
     source_url = ""
@@ -377,15 +366,16 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
     content = clean_text(item.get("content"))
 
     raw_answer = faq_answer if (page_type == "faq" and faq_answer) else content
-    short_answer = shorten_answer(raw_answer)
+    detail = shorten_answer(raw_answer)
     phone_text = extract_phones(raw_answer)
 
     question_context = faq_question or title or "相關問題"
 
-    is_lost = any(k in (question + faq_question + raw_answer) for k in ["掛失", "遺失", "被竊", "不見", "掉了"])
-    is_cash_advance = any(k in (question + faq_question + raw_answer) for k in ["預借現金", "借現金"])
-    is_tax = any(k in (question + faq_question + raw_answer) for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"])
-    is_airport = any(k in (question + faq_question + raw_answer) for k in ["機場接送", "接機", "送機"])
+    combined = question + faq_question + raw_answer
+    is_lost = any(k in combined for k in ["掛失", "遺失", "被竊", "不見", "掉了"])
+    is_cash_advance = any(k in combined for k in ["預借現金", "借現金"])
+    is_tax = any(k in combined for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"])
+    is_airport = any(k in combined for k in ["機場接送", "接機", "送機"])
 
     if is_lost:
         process = "信用卡或金融卡遺失時，請立即辦理掛失，以避免卡片遭冒用。"
@@ -462,10 +452,30 @@ def make_customer_answer(item: Dict[str, Any], question: str) -> str:
 {phone_text}
 
 【詳細說明】
-{short_answer}
+{detail}
 
 【資料來源】
 {source_url}"""
+
+    return answer.strip()
+
+
+def compact_answer(answer: str, sources: List[Dict[str, Any]]) -> str:
+    """
+    給 Copilot Studio 顯示用：避免被截斷。
+    保留重點欄位，移除過長的【詳細說明】，並固定保留【資料來源】。
+    """
+    source_url = ""
+    if sources:
+        source_url = sources[0].get("source_url") or ""
+
+    if "【詳細說明】" in answer:
+        answer = answer.split("【詳細說明】")[0].strip()
+
+    if "【資料來源】" not in answer:
+        answer += f"\n\n【資料來源】\n{source_url}"
+    elif source_url and source_url not in answer:
+        answer += f"\n{source_url}"
 
     return answer.strip()
 
@@ -487,7 +497,7 @@ def root():
     return {
         "status": "ok",
         "service": "TCB AI Customer Assistant API",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "knowledge_file": str(KNOWLEDGE_FILE.name),
         "knowledge_count": len(knowledge),
         "docs": "/docs"
@@ -498,7 +508,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "knowledge_file_exists": KNOWLEDGE_FILE.exists(),
         "knowledge_count": len(knowledge)
     }
@@ -513,6 +523,7 @@ def ask_post(req: AskRequest):
         return {
             "question": question,
             "answer": no_answer(question),
+            "full_answer": no_answer(question),
             "confidence": 0,
             "intent": detect_intent(question),
             "sources": []
@@ -523,19 +534,16 @@ def ask_post(req: AskRequest):
     sources = build_sources(results)
 
     if risk_guard(question, confidence):
-        return {
-            "question": question,
-            "answer": make_risk_answer(question, confidence, sources),
-            "confidence": confidence,
-            "intent": detect_intent(question),
-            "sources": sources
-        }
+        answer = make_risk_answer(question, sources)
+    else:
+        answer = make_customer_answer(top_item, question)
 
-    answer = make_customer_answer(top_item, question)
+    display_answer = compact_answer(answer, sources) if req.compact else answer
 
     return {
         "question": question,
-        "answer": answer,
+        "answer": display_answer,
+        "full_answer": answer,
         "confidence": confidence,
         "intent": detect_intent(question),
         "sources": sources,
@@ -550,18 +558,20 @@ def ask_post(req: AskRequest):
 def ask_get(
     q: str = Query(..., description="問題，例如：信用卡掛失怎麼辦"),
     top_k: int = Query(5, ge=1, le=10),
-    debug: bool = Query(False)
+    debug: bool = Query(False),
+    compact: bool = Query(True, description="是否回傳短版答案，Copilot 建議使用 true")
 ):
-    req = AskRequest(question=q, top_k=top_k, debug=debug)
+    req = AskRequest(question=q, top_k=top_k, debug=debug, compact=compact)
     return ask_post(req)
 
 
 @app.get("/ask_text", response_class=PlainTextResponse)
 def ask_text(
     q: str = Query(..., description="問題，例如：信用卡掛失怎麼辦"),
-    top_k: int = Query(5, ge=1, le=10)
+    top_k: int = Query(5, ge=1, le=10),
+    compact: bool = Query(True)
 ):
-    req = AskRequest(question=q, top_k=top_k, debug=False)
+    req = AskRequest(question=q, top_k=top_k, debug=False, compact=compact)
     result = ask_post(req)
     return result["answer"]
 
