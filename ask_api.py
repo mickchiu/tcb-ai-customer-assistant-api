@@ -1,17 +1,19 @@
-# ask_api_v4_rag.py
+# ask_api.py
 # -*- coding: utf-8 -*-
 # ===================================================================
-#  TCB AI Customer Assistant API — v4.0.0（RAG 向量搜尋 + 模板回答）
-#  ‧ 使用 sentence-transformers 做語意向量搜尋（不需要 OpenAI API Key）
-#  ‧ 模型：paraphrase-multilingual-MiniLM-L12-v2（支援中文）
-#  ‧ 首次啟動自動計算 embeddings 並快取到 vector_index.npy
-#  ‧ 保持與 v3 完全一致的 API 介面，Copilot 端零修改即可串接
+#  TCB AI Customer Assistant API — v4.1.0（輕量 RAG：TF-IDF + jieba）
+#  ‧ 使用 scikit-learn TF-IDF + jieba 中文斷詞做語意搜尋
+#  ‧ 不需要 sentence-transformers、不需要 PyTorch
+#  ‧ 不需要 OpenAI API Key
+#  ‧ Render 免費方案可跑（RAM < 100MB）
+#  ‧ 保持與 v3 完全一致的 API 介面，Copilot 端零修改
 # ===================================================================
 
 import json
 import re
 import os
 import numpy as np
+import jieba
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -19,26 +21,24 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity as sk_cosine
 
 # =====================  路徑與常數  =====================
 
 BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_FILE = BASE_DIR / "tcb_ai_knowledge_v5.json"
-VECTOR_CACHE   = BASE_DIR / "vector_index.npy"       # embedding 快取
-ID_CACHE       = BASE_DIR / "vector_ids.json"         # 對應 id 清單
 
-MODEL_NAME     = "paraphrase-multilingual-MiniLM-L12-v2"
 TOP_K_DEFAULT  = 5
-SIM_THRESHOLD  = 0.30        # 低於此閾值 → 無法回答
-RISK_THRESHOLD = 0.40        # 低於此 → 風險題，建議洽客服
+SIM_THRESHOLD  = 0.08        # TF-IDF cosine 閾值（比 embedding 低很多是正常的）
+RISK_THRESHOLD = 0.10        # 低於此 → 風險題
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 # =====================  FastAPI 初始化  =====================
 
 app = FastAPI(
-    title="TCB AI Customer Assistant API (RAG)",
+    title="TCB AI Customer Assistant API (RAG Lite)",
     version=VERSION,
 )
 
@@ -61,8 +61,8 @@ class AskRequest(BaseModel):
 # =====================  全域變數  =====================
 
 knowledge: List[Dict[str, Any]] = []
-model: Optional[SentenceTransformer] = None
-doc_embeddings: Optional[np.ndarray] = None   # shape: (N, dim)
+tfidf_vectorizer: Optional[TfidfVectorizer] = None
+tfidf_matrix = None   # scipy sparse matrix
 
 # =====================  Intent 中文對照  =====================
 
@@ -76,13 +76,7 @@ INTENT_MAP = {
     "general":           "一般業務",
 }
 
-# =====================  停用詞 & 風險關鍵字  =====================
-
-STOPWORDS = {
-    "請問", "怎麼", "如何", "可以", "是否", "我要", "想問",
-    "合庫", "合作金庫", "銀行", "本行", "的", "是", "嗎", "呢",
-    "一下", "辦理", "申請", "相關", "服務", "問題", "資料",
-}
+# =====================  風險關鍵字  =====================
 
 RISKY_KEYWORDS = [
     "核准", "一定過", "保證", "個人資料", "查帳", "餘額",
@@ -91,10 +85,38 @@ RISKY_KEYWORDS = [
     "身分證", "密碼", "otp", "驗證碼",
 ]
 
+# =====================  jieba 自訂詞典  =====================
+
+CUSTOM_WORDS = [
+    "信用卡", "金融卡", "預借現金", "機場接送", "機場貴賓室",
+    "掛失", "補發", "數位帳戶", "台灣Pay", "網路銀行",
+    "行動網銀", "定期存款", "活期存款", "綜合存款",
+    "信用貸款", "房屋貸款", "以房養老", "微型創業",
+    "留學生貸款", "黃金存摺", "外幣現鈔", "牌照稅",
+    "地價稅", "房屋稅", "所得稅", "繳稅", "手續費",
+    "年費", "循環利率", "違約金", "紅利積點",
+    "現金回饋", "帳單分期", "合庫", "合作金庫",
+    "未成年", "開戶", "數位存款", "保管箱", "匯款",
+    "VISA", "Combo", "JCB", "Mastercard",
+]
+
+def init_jieba():
+    """初始化 jieba 並加入銀行專用詞"""
+    for word in CUSTOM_WORDS:
+        jieba.add_word(word)
+    # 預熱斷詞引擎
+    jieba.lcut("合作金庫信用卡掛失")
+    print("[啟動] jieba 斷詞引擎初始化完成")
+
+
+def jieba_tokenize(text: str) -> str:
+    """用 jieba 斷詞，回傳空格分隔的字串（給 TF-IDF 用）"""
+    words = jieba.lcut(text)
+    return " ".join(words)
+
 # =====================  工具函式  =====================
 
 def clean_text(text: Any) -> str:
-    """清理文字：移除全形空白、多餘空格"""
     if text is None:
         return ""
     text = str(text)
@@ -103,27 +125,28 @@ def clean_text(text: Any) -> str:
     return text.strip()
 
 
-def build_embed_text(item: Dict[str, Any]) -> str:
+def build_search_text(item: Dict[str, Any]) -> str:
     """
-    組合用來做 embedding 的文字（語意搜尋用）
-    優先使用 faq_question（最能代表使用者會問的問題），
-    再加 title 與 content 前 500 字以擴充語意覆蓋範圍。
+    組合搜尋用文字：faq_question + title + content 前 600 字
+    用 jieba 斷詞後回傳
     """
     parts = []
     faq_q = clean_text(item.get("faq_question"))
     if faq_q:
-        parts.append(faq_q)
-    parts.append(clean_text(item.get("title", "")))
+        # FAQ 問題重複 3 次以提高權重
+        parts.extend([faq_q] * 3)
+    title = clean_text(item.get("title", ""))
+    if title:
+        parts.extend([title] * 2)
     content = clean_text(item.get("content", ""))
     if content:
-        parts.append(content[:500])
-    return " ".join(parts)
+        parts.append(content[:600])
+    raw = " ".join(parts)
+    return jieba_tokenize(raw)
 
 
 def detect_intent(question: str) -> str:
-    """根據關鍵字偵測業務意圖（快速分類）"""
     q = clean_text(question).lower()
-
     if any(k in q for k in ["金融卡", "visa金融卡", "combo卡", "提款卡"]):
         return "金融卡"
     if any(k in q for k in ["開戶", "帳戶", "存款", "數位帳戶", "未成年", "未成年人"]):
@@ -140,7 +163,6 @@ def detect_intent(question: str) -> str:
 
 
 def extract_phones(text: str) -> str:
-    """從文字中擷取電話號碼，找不到時回傳預設客服電話"""
     raw = re.findall(
         r"(?:\(?0\d{1,3}\)?-?\d{3,4}-?\d{3,4}|0800-?\d{3}-?\d{3}|886-?\d-?\d{4}-?\d{4})",
         text,
@@ -179,7 +201,6 @@ def shorten_answer(text: str, max_len: int = 380) -> str:
 
 
 def risk_guard(question: str, confidence: float) -> bool:
-    """判斷是否為高風險問題（涉及個人帳務、密碼等）"""
     q = clean_text(question).lower()
     if confidence < RISK_THRESHOLD:
         return True
@@ -187,29 +208,22 @@ def risk_guard(question: str, confidence: float) -> bool:
         return True
     return False
 
-# =====================  向量搜尋核心  =====================
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """計算 query 向量與所有文件向量的 cosine 相似度"""
-    # a: (dim,)  b: (N, dim)
-    a_norm = a / (np.linalg.norm(a) + 1e-10)
-    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-10)
-    return b_norm @ a_norm   # shape: (N,)
-
+# =====================  TF-IDF 搜尋核心  =====================
 
 def semantic_search(question: str, top_k: int = TOP_K_DEFAULT) -> List[Tuple[Dict[str, Any], float]]:
     """
-    語意向量搜尋：
-    1. 將使用者問題 encode 為向量
-    2. 與所有文件向量做 cosine similarity
-    3. 依相似度排序，取 top_k
+    TF-IDF 語意搜尋：
+    1. 將問題用 jieba 斷詞
+    2. 轉成 TF-IDF 向量
+    3. 與所有文件做 cosine similarity
+    4. 取 top_k
     """
-    global model, doc_embeddings, knowledge
+    global tfidf_vectorizer, tfidf_matrix, knowledge
 
-    q_embedding = model.encode(question, normalize_embeddings=True)
-    scores = cosine_similarity(q_embedding, doc_embeddings)   # (N,)
+    q_tokenized = jieba_tokenize(clean_text(question))
+    q_vec = tfidf_vectorizer.transform([q_tokenized])
+    scores = sk_cosine(q_vec, tfidf_matrix).flatten()
 
-    # 取 top_k 索引
     top_indices = np.argsort(scores)[::-1][:top_k]
 
     results = []
@@ -223,7 +237,6 @@ def semantic_search(question: str, top_k: int = TOP_K_DEFAULT) -> List[Tuple[Dic
 # =====================  來源與回答組裝  =====================
 
 def build_sources(results: List[Tuple[Dict[str, Any], float]]) -> List[Dict[str, Any]]:
-    """組裝 sources 欄位（與 v3 格式一致）"""
     if not results:
         return []
 
@@ -250,7 +263,6 @@ def build_sources(results: List[Tuple[Dict[str, Any], float]]) -> List[Dict[str,
 
 
 def make_risk_answer(question: str, sources: List[Dict[str, Any]]) -> str:
-    """風險題統一回覆模板"""
     intent = detect_intent(question)
     source_url = sources[0].get("source_url", "") if sources else ""
 
@@ -280,7 +292,6 @@ def make_risk_answer(question: str, sources: List[Dict[str, Any]]) -> str:
 
 
 def make_customer_answer(item: Dict[str, Any], question: str, sim_score: float) -> str:
-    """依據最佳匹配文件，組合模板回答"""
     intent_raw = clean_text(item.get("intent"))
     intent = INTENT_MAP.get(intent_raw, detect_intent(question))
 
@@ -292,14 +303,12 @@ def make_customer_answer(item: Dict[str, Any], question: str, sim_score: float) 
     faq_answer   = clean_text(item.get("faq_answer"))
     content      = clean_text(item.get("content"))
 
-    # 優先使用 FAQ 回答，否則用 content
     raw_answer = faq_answer if (page_type == "faq" and faq_answer) else content
     detail     = shorten_answer(raw_answer)
     phone_text = extract_phones(raw_answer)
 
     question_context = faq_question or title or "相關問題"
 
-    # ---- 場景特化提示 ----
     combined = question + faq_question + raw_answer
     is_lost         = any(k in combined for k in ["掛失", "遺失", "被竊", "不見", "掉了"])
     is_cash_advance = any(k in combined for k in ["預借現金", "借現金"])
@@ -399,7 +408,6 @@ def make_customer_answer(item: Dict[str, Any], question: str, sim_score: float) 
 
 
 def compact_answer(answer: str, sources: List[Dict[str, Any]]) -> str:
-    """精簡版回答（移除【詳細說明】區塊，適合 Copilot 顯示）"""
     source_url = sources[0].get("source_url", "") if sources else ""
 
     if "【詳細說明】" in answer:
@@ -424,10 +432,9 @@ def no_answer(question: str) -> str:
         "0800-033-175 / 04-2227-3131"
     )
 
-# =====================  知識庫載入 & Embedding  =====================
+# =====================  知識庫載入 & TF-IDF 建置  =====================
 
 def load_knowledge():
-    """載入知識庫 JSON 並清理文字"""
     global knowledge
 
     if not KNOWLEDGE_FILE.exists():
@@ -453,60 +460,48 @@ def load_knowledge():
     print(f"[啟動] 知識庫載入完成，共 {len(knowledge)} 筆文件")
 
 
-def build_embeddings():
-    """
-    計算所有文件的 embedding 向量，並快取到 .npy 檔案。
-    若快取檔存在且筆數一致，直接載入。
-    """
-    global model, doc_embeddings
+def build_tfidf_index():
+    """建立 TF-IDF 向量索引"""
+    global tfidf_vectorizer, tfidf_matrix
 
-    # 載入模型
-    print(f"[啟動] 載入向量模型：{MODEL_NAME} ...")
-    model = SentenceTransformer(MODEL_NAME)
-    print("[啟動] 模型載入完成")
+    print(f"[啟動] 正在建立 TF-IDF 索引（{len(knowledge)} 筆文件）...")
 
-    # 檢查快取
-    if VECTOR_CACHE.exists() and ID_CACHE.exists():
-        with open(ID_CACHE, "r", encoding="utf-8") as f:
-            cached_ids = json.load(f)
-        current_ids = [item.get("id", "") for item in knowledge]
-        if cached_ids == current_ids:
-            doc_embeddings = np.load(str(VECTOR_CACHE))
-            print(f"[啟動] 從快取載入 embeddings，shape={doc_embeddings.shape}")
-            return
+    # 組合所有文件的搜尋文字（已含 jieba 斷詞）
+    doc_texts = [build_search_text(item) for item in knowledge]
 
-    # 需要重新計算
-    print(f"[啟動] 正在計算 {len(knowledge)} 筆文件 embeddings ...")
-    texts = [build_embed_text(item) for item in knowledge]
-    doc_embeddings = model.encode(texts, normalize_embeddings=True,
-                                  show_progress_bar=True, batch_size=32)
-    doc_embeddings = np.array(doc_embeddings, dtype=np.float32)
+    # 建立 TF-IDF 向量化器
+    # analyzer="word" 因為已經用 jieba 斷好了
+    # ngram_range=(1,2) 支援二元組合，例如「信用 卡」「預借 現金」
+    # sublinear_tf=True 對長文件做 log 壓縮，避免長文壟斷
+    tfidf_vectorizer = TfidfVectorizer(
+        analyzer="word",
+        ngram_range=(1, 2),
+        max_features=10000,
+        sublinear_tf=True,
+    )
 
-    # 存快取
-    np.save(str(VECTOR_CACHE), doc_embeddings)
-    with open(ID_CACHE, "w", encoding="utf-8") as f:
-        json.dump([item.get("id", "") for item in knowledge], f, ensure_ascii=False)
-
-    print(f"[啟動] Embeddings 計算完成並快取，shape={doc_embeddings.shape}")
+    tfidf_matrix = tfidf_vectorizer.fit_transform(doc_texts)
+    print(f"[啟動] TF-IDF 索引建立完成，矩陣 shape={tfidf_matrix.shape}")
 
 # =====================  API 端點  =====================
 
 @app.on_event("startup")
 def startup():
+    init_jieba()
     load_knowledge()
-    build_embeddings()
-    print(f"[啟動] TCB AI RAG API v{VERSION} 啟動完成 ✓")
+    build_tfidf_index()
+    print(f"[啟動] TCB AI RAG Lite API v{VERSION} 啟動完成 ✓")
 
 
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "service": "TCB AI Customer Assistant API (RAG)",
+        "service": "TCB AI Customer Assistant API (RAG Lite)",
         "version": VERSION,
         "knowledge_file": str(KNOWLEDGE_FILE.name),
         "knowledge_count": len(knowledge),
-        "model": MODEL_NAME,
+        "search_engine": "TF-IDF + jieba",
         "docs": "/docs",
     }
 
@@ -518,7 +513,7 @@ def health():
         "version": VERSION,
         "knowledge_file_exists": KNOWLEDGE_FILE.exists(),
         "knowledge_count": len(knowledge),
-        "embeddings_ready": doc_embeddings is not None,
+        "tfidf_ready": tfidf_matrix is not None,
     }
 
 
@@ -526,7 +521,6 @@ def health():
 def ask_post(req: AskRequest):
     question = clean_text(req.question)
 
-    # 語意搜尋
     results = semantic_search(question, req.top_k)
 
     if not results:
@@ -541,7 +535,7 @@ def ask_post(req: AskRequest):
         }
 
     top_item, top_score = results[0]
-    confidence = round(min(top_score / 0.80, 1.0), 2)   # 0.80 作為滿分基準
+    confidence = round(min(top_score / 0.35, 1.0), 2)
     sources = build_sources(results)
 
     if risk_guard(question, confidence):
@@ -560,7 +554,7 @@ def ask_post(req: AskRequest):
         "sources":     sources,
         "debug": {
             "top_sim_score": round(top_score, 4),
-            "model": MODEL_NAME,
+            "engine": "tfidf+jieba",
         } if req.debug else None,
     }
 
