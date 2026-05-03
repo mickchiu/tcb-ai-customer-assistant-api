@@ -1,345 +1,244 @@
+# ask_api.py  v7.0.0
 # -*- coding: utf-8 -*-
-# ask_api.py  v6.0.0 — TCB AI 客服知識檢索 API（完整版）
-# 改動摘要：
-#   1. VERSION 升至 6.0.0
-#   2. 以 lifespan 取代已棄用的 @app.on_event("startup")
-#   3. load_knowledge() 額外清洗 keywords / category / last_updated
-#   4. build_search_text() 納入 keywords（×2 權重）
-#   5. shorten_answer() 預設 max_len 由 380 → 500
-#   6. KNOWLEDGE_FILE 改指 tcb_ai_knowledge_v6.json
+"""
+TCB AI Customer Assistant - Ultra-Light API
+Only search, never generate answers.
+Let Copilot Studio AI handle the talking.
+"""
 
-import json, re, math, os
-from typing import List, Optional
+import json
+import re
+import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
 
-# ── 常數 ─────────────────────────────────────────────
-VERSION = "6.0.0"
-KNOWLEDGE_FILE = "tcb_ai_knowledge_v6.json"
-SIM_THRESHOLD = 0.08
-RISK_THRESHOLD = 0.30
-TOP_K_DEFAULT = 5
+# ============================================================
+# CONFIG
+# ============================================================
+VERSION = "7.0.0"
+KNOWLEDGE_FILE = Path(__file__).resolve().parent / "tcb_ai_knowledge_v6.json"
+DEFAULT_TOP_K = 5
+MAX_CONTENT_LEN = 600
 
-INTENT_MAP = {
-    "信用卡": "credit_card",
-    "存款": "deposit_exchange",
-    "外匯": "deposit_exchange",
-    "匯率": "deposit_exchange",
-    "定存": "deposit_exchange",
-    "活存": "deposit_exchange",
-    "數位": "digital_banking",
-    "網銀": "digital_banking",
-    "網路銀行": "digital_banking",
-    "行動銀行": "digital_banking",
-    "eATM": "digital_banking",
-    "貸款": "loan",
-    "房貸": "loan",
-    "信貸": "loan",
-    "理財": "wealth_management",
-    "基金": "wealth_management",
-    "保險": "insurance",
-    "親子": "wealth_management",
-}
-
-RISKY_KEYWORDS = [
-    "密碼", "帳號", "身分證", "個資", "詐騙", "盜刷",
-    "掛失", "停卡", "凍結", "解鎖", "OTP",
-]
-
-# ── 全域變數（啟動時填入）──────────────────────────────
-knowledge: List[dict] = []
-corpus: List[str] = []
-vectorizer: Optional[TfidfVectorizer] = None
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+knowledge_data = []
+tfidf_vectorizer = None
 tfidf_matrix = None
 
-
-# ── 工具函式 ──────────────────────────────────────────
+# ============================================================
+# TEXT UTILS
+# ============================================================
 def clean_text(text: str) -> str:
-    """移除 HTML 標籤、多餘空白"""
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def detect_intent(query: str) -> Optional[str]:
-    for kw, intent in INTENT_MAP.items():
-        if kw in query:
-            return intent
-    return None
-
-
-def extract_phones(text: str) -> List[str]:
-    return re.findall(r"[\d\-()]{7,}", text)
-
-
-def shorten_answer(text: str, max_len: int = 500) -> str:
-    """截斷過長回答，保留完整句子"""
-    if len(text) <= max_len:
-        return text
-    cut = text[:max_len]
-    # 往回找到最後一個句號、問號或換行
-    for ch in ("。", "！", "？", "\n"):
-        pos = cut.rfind(ch)
-        if pos > max_len // 2:
-            return cut[: pos + 1]
-    return cut + "…"
-
-
-def risk_guard(query: str) -> bool:
-    return any(kw in query for kw in RISKY_KEYWORDS)
-
-
-# ── 知識載入 ──────────────────────────────────────────
-def load_knowledge():
-    global knowledge, corpus, vectorizer, tfidf_matrix
-
-    with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    # 清洗
-    for item in raw:
-        for key in (
-            "content", "title", "faq_question", "faq_answer",
-            "keywords", "category", "last_updated",
-        ):
-            if key in item and isinstance(item[key], str):
-                item[key] = clean_text(item[key])
-
-    knowledge = raw
-    corpus = [build_search_text(item) for item in knowledge]
-
-    vectorizer = TfidfVectorizer(
-        analyzer="char_wb", ngram_range=(2, 4), max_features=80000
-    )
-    tfidf_matrix = vectorizer.fit_transform(corpus)
-    print(f"[v{VERSION}] 載入 {len(knowledge)} 筆知識，TF-IDF 維度 {tfidf_matrix.shape}")
+    """Remove HTML tags and extra whitespace."""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def build_search_text(item: dict) -> str:
-    """將各欄位組合成搜尋用文本，重要欄位加權"""
-    title = item.get("title", "")
-    content = item.get("content", "")
+    """
+    Build weighted search text for TF-IDF indexing.
+    FAQ question x3, title x2, content[:600] x1
+    """
+    parts = []
+
     faq_q = item.get("faq_question", "")
-    faq_a = item.get("faq_answer", "")
-    keywords = item.get("keywords", "")
-    # title ×3、faq_question ×3、keywords ×2、其餘 ×1
-    parts = [title] * 3 + [faq_q] * 3 + [keywords] * 2 + [content, faq_a]
-    return " ".join(p for p in parts if p)
+    if faq_q:
+        parts.extend([faq_q] * 3)
+
+    title = item.get("title", "")
+    if title:
+        parts.extend([title] * 2)
+
+    content = clean_text(item.get("content", ""))
+    if content:
+        parts.append(content[:MAX_CONTENT_LEN])
+
+    return " ".join(parts)
 
 
-# ── 語意搜尋 ──────────────────────────────────────────
-def semantic_search(query: str, top_k: int = TOP_K_DEFAULT,
-                    intent_filter: Optional[str] = None) -> List[dict]:
-    q_vec = vectorizer.transform([query])
-    sims = cosine_similarity(q_vec, tfidf_matrix).flatten()
+# ============================================================
+# KNOWLEDGE LOADING & INDEXING
+# ============================================================
+def load_knowledge():
+    """Load knowledge base JSON file."""
+    global knowledge_data
+    with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+        knowledge_data = json.load(f)
+    print(f"[INFO] Loaded {len(knowledge_data)} knowledge chunks")
 
-    scored = []
-    for idx, score in enumerate(sims):
-        if score < SIM_THRESHOLD:
-            continue
-        item = knowledge[idx]
-        # intent 篩選
-        if intent_filter and item.get("intent") != intent_filter:
-            continue
-        # priority 加分
-        priority = item.get("search_priority", "normal")
-        bonus = {"high": 0.05, "normal": 0.0, "low": -0.05}.get(priority, 0.0)
-        scored.append((idx, score + bonus))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+def build_tfidf_index():
+    """Build TF-IDF index from knowledge base."""
+    global tfidf_vectorizer, tfidf_matrix
+
+    corpus = [build_search_text(item) for item in knowledge_data]
+
+    tfidf_vectorizer = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(1, 3),
+        max_features=15000,
+        sublinear_tf=True,
+    )
+    tfidf_matrix = tfidf_vectorizer.fit_transform(corpus)
+    print(f"[INFO] TF-IDF index built: {tfidf_matrix.shape}")
+
+
+# ============================================================
+# SEARCH
+# ============================================================
+def semantic_search(query: str, top_k: int = DEFAULT_TOP_K) -> list:
+    """
+    Search knowledge base using TF-IDF cosine similarity.
+    Returns list of matched snippets with scores.
+    """
+    if tfidf_vectorizer is None or tfidf_matrix is None:
+        return []
+
+    q_vec = tfidf_vectorizer.transform([query])
+    scores = cosine_similarity(q_vec, tfidf_matrix).flatten()
+
+    # Get top_k indices sorted by score descending
+    top_indices = scores.argsort()[::-1][:top_k]
+
     results = []
-    for idx, score in scored[:top_k]:
-        entry = dict(knowledge[idx])
-        entry["score"] = round(float(score), 4)
-        results.append(entry)
+    for idx in top_indices:
+        score = float(scores[idx])
+        if score <= 0:
+            continue
+
+        item = knowledge_data[idx]
+        content = clean_text(item.get("content", ""))
+
+        results.append({
+            "id": item.get("id", ""),
+            "title": item.get("title", ""),
+            "content": content[:MAX_CONTENT_LEN],
+            "faq_question": item.get("faq_question", ""),
+            "faq_answer": item.get("faq_answer", ""),
+            "source_url": item.get("source_url", ""),
+            "page_type": item.get("page_type", ""),
+            "score": round(score, 4),
+        })
+
     return results
 
 
-# ── 回答組裝 ──────────────────────────────────────────
-def build_sources(results: List[dict]) -> List[dict]:
-    sources = []
-    for r in results:
-        sources.append({
-            "id": r.get("id"),
-            "title": r.get("title"),
-            "url": r.get("source_url"),
-            "score": r.get("score"),
-        })
-    return sources
-
-
-def make_risk_answer(query: str) -> dict:
-    return {
-        "answer": (
-            "您的問題涉及帳戶安全相關事項，為保障您的權益，"
-            "建議您撥打合庫客服專線 (04)2227-3131 或 0800-033175，"
-            "由專人為您處理。"
-        ),
-        "sources": [],
-        "intent": detect_intent(query),
-        "risk_flag": True,
-        "version": VERSION,
-    }
-
-
-def make_customer_answer(query: str, results: List[dict]) -> dict:
-    if not results:
-        return no_answer(query)
-
-    best = results[0]
-    # 優先使用 FAQ
-    if best.get("faq_answer"):
-        answer_text = best["faq_answer"]
-    else:
-        answer_text = best.get("content", "")
-
-    answer_text = shorten_answer(answer_text)
-    phones = extract_phones(answer_text)
-
-    return {
-        "answer": answer_text,
-        "sources": build_sources(results),
-        "intent": best.get("intent"),
-        "risk_flag": False,
-        "phones": phones,
-        "version": VERSION,
-    }
-
-
-def compact_answer(query: str, results: List[dict]) -> str:
-    """純文字回覆（給 /ask_text）"""
-    if not results:
-        return f"很抱歉，目前找不到與「{query}」相關的資訊。建議撥打客服專線 0800-033175。"
-    best = results[0]
-    if best.get("faq_answer"):
-        return shorten_answer(best["faq_answer"])
-    return shorten_answer(best.get("content", ""))
-
-
-def no_answer(query: str) -> dict:
-    return {
-        "answer": f"很抱歉，目前找不到與「{query}」相關的資訊。建議您撥打客服專線 0800-033175 或 (04)2227-3131。",
-        "sources": [],
-        "intent": detect_intent(query),
-        "risk_flag": False,
-        "version": VERSION,
-    }
-
-
-# ── FastAPI lifespan ──────────────────────────────────
+# ============================================================
+# FASTAPI APP
+# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
+    """Startup: load knowledge + build index."""
+    t0 = time.time()
     load_knowledge()
+    build_tfidf_index()
+    print(f"[INFO] Ready in {time.time() - t0:.2f}s")
     yield
-    # shutdown（如有需要可在此釋放資源）
-
+    print("[INFO] Shutting down")
 
 app = FastAPI(
-    title="TCB AI 客服知識 API",
+    title="TCB AI Customer Assistant API",
+    description="Ultra-light: search only, no answer generation",
     version=VERSION,
     lifespan=lifespan,
 )
 
 
-# ── Request Model ─────────────────────────────────────
+# ============================================================
+# REQUEST / RESPONSE MODELS
+# ============================================================
 class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="User question")
+    top_k: int = Field(DEFAULT_TOP_K, ge=1, le=20)
+
+
+class SnippetResponse(BaseModel):
+    id: str
+    title: str
+    content: str
+    faq_question: str
+    faq_answer: str
+    source_url: str
+    page_type: str
+    score: float
+
+
+class AskResponse(BaseModel):
+    matched: bool
     query: str
-    top_k: int = TOP_K_DEFAULT
-    intent: Optional[str] = None
+    count: int
+    snippets: list
 
 
-# ── API 端點 ──────────────────────────────────────────
-@app.post("/ask")
-async def ask_post(req: AskRequest):
-    query = req.query.strip()
-    if not query:
-        return JSONResponse({"error": "query 不可為空"}, status_code=400)
-
-    if risk_guard(query):
-        return make_risk_answer(query)
-
-    intent = req.intent or detect_intent(query)
-    results = semantic_search(query, top_k=req.top_k, intent_filter=intent)
-    return make_customer_answer(query, results)
-
-
-@app.get("/ask")
-async def ask_get(
-    q: str = Query(..., min_length=1),
-    top_k: int = Query(TOP_K_DEFAULT, ge=1, le=20),
-    intent: Optional[str] = Query(None),
-):
-    query = q.strip()
-    if risk_guard(query):
-        return make_risk_answer(query)
-
-    intent_val = intent or detect_intent(query)
-    results = semantic_search(query, top_k=top_k, intent_filter=intent_val)
-    return make_customer_answer(query, results)
-
-
-@app.get("/ask_text")
-async def ask_text(
-    q: str = Query(..., min_length=1),
-    top_k: int = Query(TOP_K_DEFAULT, ge=1, le=20),
-    intent: Optional[str] = Query(None),
-):
-    query = q.strip()
-    if risk_guard(query):
-        return make_risk_answer(query)["answer"]
-
-    intent_val = intent or detect_intent(query)
-    results = semantic_search(query, top_k=top_k, intent_filter=intent_val)
-    return compact_answer(query, results)
-
-
-@app.get("/search")
-async def search(
-    q: str = Query(..., min_length=1),
-    top_k: int = Query(TOP_K_DEFAULT, ge=1, le=20),
-    intent: Optional[str] = Query(None),
-):
-    query = q.strip()
-    intent_val = intent or detect_intent(query)
-    results = semantic_search(query, top_k=top_k, intent_filter=intent_val)
-    return {"query": query, "intent": intent_val, "results": results}
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return f"""
-    <html><body>
-    <h2>TCB AI 客服知識 API v{VERSION}</h2>
-    <p>知識庫筆數：{len(knowledge)}</p>
-    <ul>
-      <li>POST /ask — JSON 查詢</li>
-      <li>GET  /ask?q=... — 快速查詢</li>
-      <li>GET  /ask_text?q=... — 純文字回覆</li>
-      <li>GET  /search?q=... — 原始搜尋結果</li>
-      <li>GET  /health — 健康檢查</li>
-    </ul>
-    </body></html>
-    """
-
-
-@app.get("/health")
-async def health():
+# ============================================================
+# ENDPOINTS
+# ============================================================
+@app.get("/")
+def root():
+    """Service info."""
     return {
-        "status": "ok",
+        "service": "TCB AI Customer Assistant",
         "version": VERSION,
-        "knowledge_count": len(knowledge),
-        "tfidf_shape": list(tfidf_matrix.shape) if tfidf_matrix is not None else None,
+        "mode": "ultra-light (search only)",
+        "knowledge_chunks": len(knowledge_data),
     }
 
 
-# ── 本機執行 ──────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("ask_api:app", host="0.0.0.0", port=8000, reload=True)
+@app.get("/health")
+def health():
+    """Health check."""
+    return {
+        "status": "ok",
+        "version": VERSION,
+        "knowledge_loaded": len(knowledge_data) > 0,
+        "index_ready": tfidf_matrix is not None,
+    }
+
+
+@app.post("/ask")
+def ask_post(req: AskRequest):
+    """Main endpoint (POST): search knowledge base."""
+    snippets = semantic_search(req.question, req.top_k)
+    return {
+        "matched": len(snippets) > 0,
+        "query": req.question,
+        "count": len(snippets),
+        "snippets": snippets,
+    }
+
+
+@app.get("/ask")
+def ask_get(
+    q: str = Query(..., min_length=1, description="User question"),
+    top_k: int = Query(DEFAULT_TOP_K, ge=1, le=20),
+):
+    """Main endpoint (GET): search knowledge base."""
+    snippets = semantic_search(q, top_k)
+    return {
+        "matched": len(snippets) > 0,
+        "query": q,
+        "count": len(snippets),
+        "snippets": snippets,
+    }
+
+
+@app.get("/search")
+def search(
+    q: str = Query(..., min_length=1, description="Search query"),
+    top_k: int = Query(10, ge=1, le=50),
+):
+    """Raw search endpoint with more results."""
+    snippets = semantic_search(q, top_k)
+    return {
+        "query": q,
+        "count": len(snippets),
+        "results": snippets,
+    }
