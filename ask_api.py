@@ -1,15 +1,5 @@
 # ask_api.py
 # -*- coding: utf-8 -*-
-"""
-TCB AI Customer Assistant API
-
-用途：
-- 讀取 tcb_ai_knowledge_v5.json
-- 提供 /ask 給 Copilot Studio / Power Automate / Custom Connector 呼叫
-- FAQ 精準優先
-- 避免 sources 混入太多不相關資料
-- 回傳 answer / confidence / sources
-"""
 
 import json
 import re
@@ -27,7 +17,7 @@ KNOWLEDGE_FILE = BASE_DIR / "tcb_ai_knowledge_v5.json"
 
 app = FastAPI(
     title="TCB AI Customer Assistant API",
-    version="1.1.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -51,13 +41,16 @@ knowledge: List[Dict[str, Any]] = []
 STOPWORDS = {
     "請問", "怎麼", "如何", "可以", "是否", "我要", "想問",
     "合庫", "合作金庫", "銀行", "本行", "的", "是", "嗎", "呢",
-    "一下", "辦理", "申請", "相關", "服務"
+    "一下", "辦理", "申請", "相關", "服務", "問題"
 }
 
+
 SYNONYMS = {
-    "掛失": ["遺失", "不見", "被竊", "被偷", "掉了", "補發"],
+    "掛失": ["遺失", "不見", "被竊", "被偷", "掉了", "補發", "遺失怎麼辦"],
     "信用卡": ["卡片", "國際信用卡", "持卡", "刷卡"],
     "金融卡": ["visa金融卡", "combo卡", "提款卡"],
+    "開戶": ["帳戶", "存款", "數位帳戶", "預約開戶"],
+    "貸款": ["房貸", "信貸", "信用貸款", "房屋貸款"],
     "繳稅": ["牌照稅", "地價稅", "房屋稅", "所得稅", "網路繳稅"],
     "預借現金": ["借現金", "現金", "預借"],
     "額度": ["信用額度", "臨時提高", "調高額度"],
@@ -110,6 +103,24 @@ def load_knowledge():
 @app.on_event("startup")
 def startup():
     load_knowledge()
+
+
+def detect_intent(question: str) -> str:
+    q = clean_text(question).lower()
+
+    if any(k in q for k in ["信用卡", "卡片", "掛失", "刷卡", "預借現金", "額度", "帳單"]):
+        return "信用卡"
+
+    if any(k in q for k in ["開戶", "帳戶", "存款", "數位帳戶"]):
+        return "開戶"
+
+    if any(k in q for k in ["貸款", "房貸", "信貸", "信用貸款"]):
+        return "貸款"
+
+    if any(k in q for k in ["繳稅", "牌照稅", "地價稅", "房屋稅", "所得稅"]):
+        return "繳稅"
+
+    return "其他"
 
 
 def tokenize(question: str) -> List[str]:
@@ -172,17 +183,14 @@ def score_item(item: Dict[str, Any], question: str, terms: List[str]) -> float:
             score += 60
 
     important_terms = [
-        "掛失", "遺失", "不見", "被竊",
-        "預借現金", "繳稅", "機場接送",
-        "帳單", "額度", "客服", "電話"
+        "掛失", "遺失", "不見", "被竊", "被偷",
+        "信用卡", "金融卡", "預借現金", "繳稅",
+        "機場接送", "帳單", "額度", "客服", "電話",
+        "開戶", "貸款"
     ]
 
     for term in terms:
-        term = term.lower()
-
-        weight = 1.0
-        if term in important_terms:
-            weight = 2.0
+        weight = 2.0 if term in important_terms else 1.0
 
         if term in faq_question:
             score += 12 * weight
@@ -245,7 +253,30 @@ def build_sources(results: List[Tuple[Dict[str, Any], float]]) -> List[Dict[str,
     return sources
 
 
-def make_customer_answer(item: Dict[str, Any]) -> str:
+def shorten_answer(text: str, max_len: int = 650) -> str:
+    text = clean_text(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "..."
+
+
+def extract_phones(text: str) -> str:
+    phones = re.findall(r"(?:\(?0\d{1,3}\)?-?\d{3,4}-?\d{3,4}|0800-?\d{3}-?\d{3}|886-?\d-?\d{4}-?\d{4})", text)
+    clean_phones = []
+    for p in phones:
+        p = p.replace("(", "").replace(")", "")
+        if p not in clean_phones:
+            clean_phones.append(p)
+
+    if clean_phones:
+        return " / ".join(clean_phones[:4])
+
+    return "請洽合庫官方客服或鄰近分行確認。"
+
+
+def make_customer_answer(item: Dict[str, Any], question: str) -> str:
+    intent = detect_intent(question)
+
     title = clean_text(item.get("title"))
     source_url = clean_text(item.get("source_url"))
     page_type = clean_text(item.get("page_type"))
@@ -255,52 +286,50 @@ def make_customer_answer(item: Dict[str, Any]) -> str:
     content = clean_text(item.get("content"))
 
     raw_answer = faq_answer if (page_type == "faq" and faq_answer) else content
-    raw_answer = raw_answer[:1500]
+    short_answer = shorten_answer(raw_answer)
+    phone_text = extract_phones(raw_answer)
 
-    # ===== 分析內容 =====
-    is_lost = any(k in (faq_question + raw_answer) for k in ["掛失", "遺失", "被竊"])
-    
-    # 抓電話
-    phones = re.findall(r"(0\d{1,3}-?\d{6,8}|0800-?\d{3}-?\d{3})", raw_answer)
-    phone_text = " / ".join(set(phones)) if phones else "請洽官方客服"
+    question_context = faq_question or title or "相關問題"
 
-    # ===== 組客服格式 =====
+    is_lost = any(k in (question + faq_question + raw_answer) for k in ["掛失", "遺失", "被竊", "不見", "掉了"])
+
     if is_lost:
-        answer = f"""【處理方式】
-信用卡或金融卡遺失時，請立即辦理掛失，以避免被冒用。
+        process = "信用卡或金融卡遺失時，請立即辦理掛失，以避免卡片遭冒用。"
+        steps = (
+            "1. 立即撥打客服專線辦理口頭掛失\n"
+            "2. 依銀行規定至分行補辦書面手續\n"
+            "3. 如需繼續使用，申請補發新卡"
+        )
+        notes = (
+            "- 掛失後可降低卡片遭冒用風險\n"
+            "- 掛失前如已遭冒用，仍可能依規定負擔自付額\n"
+            "- 掛失或補發可能產生手續費，實際費用請依官網或分行說明為準"
+        )
+    else:
+        process = f"以下為合庫官網針對「{question_context}」提供的說明。"
+        steps = "請依合庫官網或業務單位公告方式辦理；如涉及個人資料或帳務狀態，建議洽客服或分行確認。"
+        notes = "- 各項業務可能依身分、產品別、申請方式或最新公告而不同\n- 若涉及費用、資格或時效，建議以官網與分行說明為準"
+
+    answer = f"""【業務類型】
+{intent}
+
+【處理方式】
+{process}
 
 【步驟】
-1. 立即撥打客服專線辦理掛失
-2. 後續至原發卡分行補辦書面手續
-3. 申請補發新卡
+{steps}
 
 【注意事項】
-- 掛失後即可停止卡片使用，降低風險
-- 掛失前可能有自負額（依銀行規定）
-- 掛失後通常會收取手續費
+{notes}
 
 【客服電話】
 {phone_text}
 
 【詳細說明】
-{raw_answer}
+{short_answer}
 
-資料來源：{source_url}
-"""
-    else:
-        answer = f"""【處理方式】
-{title or "請參考以下說明"}
-
-【步驟】
-請依下列方式辦理：
-
-【詳細說明】
-{raw_answer}
-
-【客服電話】
-{phone_text}
-
-資料來源：{source_url}
+【資料來源】
+{source_url}
 """
 
     return answer.strip()
@@ -308,8 +337,13 @@ def make_customer_answer(item: Dict[str, Any]) -> str:
 
 def no_answer(question: str) -> str:
     return (
-        "目前知識庫沒有找到足夠明確的答案，為避免提供錯誤資訊，"
-        "建議請客戶補充業務類型、卡別或申辦項目，或轉由人工客服確認。"
+        "【處理方式】\n"
+        "目前知識庫沒有找到足夠明確的答案，為避免提供錯誤資訊，建議轉由人工客服確認。\n\n"
+        "【注意事項】\n"
+        "- 請補充業務類型，例如信用卡、開戶、貸款或繳稅\n"
+        "- 如涉及個人帳務、身分資料或即時狀態，請以客服或分行查詢結果為準\n\n"
+        "【客服電話】\n"
+        "請洽合庫官方客服或鄰近分行確認。"
     )
 
 
@@ -318,6 +352,7 @@ def root():
     return {
         "status": "ok",
         "service": "TCB AI Customer Assistant API",
+        "version": "2.0.0",
         "knowledge_file": str(KNOWLEDGE_FILE.name),
         "knowledge_count": len(knowledge),
         "docs": "/docs"
@@ -328,6 +363,7 @@ def root():
 def health():
     return {
         "status": "ok",
+        "version": "2.0.0",
         "knowledge_file_exists": KNOWLEDGE_FILE.exists(),
         "knowledge_count": len(knowledge)
     }
@@ -343,27 +379,30 @@ def ask_post(req: AskRequest):
             "question": question,
             "answer": no_answer(question),
             "confidence": 0,
+            "intent": detect_intent(question),
             "sources": []
         }
 
     top_item, top_score = results[0]
     confidence = round(min(top_score / 80, 1), 2)
 
-    if confidence < 0.25:
+    if confidence < 0.4:
         return {
             "question": question,
             "answer": no_answer(question),
             "confidence": confidence,
+            "intent": detect_intent(question),
             "sources": build_sources(results)
         }
 
-    answer = make_customer_answer(top_item)
+    answer = make_customer_answer(top_item, question)
     sources = build_sources(results)
 
     return {
         "question": question,
         "answer": answer,
         "confidence": confidence,
+        "intent": detect_intent(question),
         "sources": sources,
         "debug": {
             "terms": tokenize(question),
